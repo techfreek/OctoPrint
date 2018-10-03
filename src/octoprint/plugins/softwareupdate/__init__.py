@@ -24,6 +24,11 @@ from . import version_checks, updaters, exceptions, util, cli
 
 from flask_babel import gettext
 
+try:
+	from os import scandir
+except ImportError:
+	from scandir import scandir
+
 from octoprint.server.util.flask import no_firstrun_access, with_revalidation_checking, check_etag
 from octoprint.server import VERSION, REVISION, BRANCH
 from octoprint.access import USER_GROUP
@@ -207,6 +212,20 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		self._environment_supported = supported
 		self._environment_versions = versions
 		self._environment_ready.set()
+
+	@classmethod
+	def _get_disk_size(cls, path):
+		total = 0
+		for entry in scandir(path):
+			if entry.is_dir():
+				total += cls._get_disk_size(entry.path)
+			elif entry.is_file():
+				total += entry.stat().st_size
+		return total
+
+	def _free_space(self, path, size):
+		from psutil import disk_usage
+		return disk_usage(path).free > size
 
 	def _load_version_cache(self):
 		if not os.path.isfile(self._version_cache_path):
@@ -608,6 +627,10 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		else:
 			force = False
 
+		(able, reason) = self.can_perform_update(targets)
+		if not able:
+			return flask.make_response(reason, 409)
+
 		to_be_checked, checks = self.perform_updates(targets=targets, force=force)
 		return flask.jsonify(dict(order=to_be_checked, checks=checks))
 
@@ -830,6 +853,28 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		                                   error=error)
 		self._version_cache_dirty = True
 		return information, update_available, update_possible, online, error
+
+	def can_perform_update(self, targets):
+		total_space = 0
+		checks = self._get_configured_checks()
+
+		for target in targets:
+			check = self._populated_check(target, checks.get(target))
+
+			# TODO: figure out why this isn't reliable on my local install
+			path = check.get("update_folder", check.get("checkout_folder", None))
+			if path is None:
+				self._logger.debug("No path for {}".format(target))
+				continue
+
+			total_space += self._get_disk_size(path)
+
+		# TODO: add support for multiple partitions/drives
+		if not self._free_space(os.getcwd(), total_space):
+			self._send_client_message("Not enough space on {} to update".format(os.getcwd()))
+			return False, "Not enough space"
+
+		return True, "Okay"
 
 	def perform_updates(self, force=False, **kwargs):
 		"""
